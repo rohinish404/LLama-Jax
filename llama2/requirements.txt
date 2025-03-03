@@ -3,3 +3,4 @@ sentencepiece
 tqdm
 flax
 optax
+torch

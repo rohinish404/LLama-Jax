@@ -20,38 +20,53 @@ class ModelArgs:
     max_batch_size: int = 32
     max_seq_len: int = 2048
 
+    device: str = None
+
 
 def polar(rho, theta):
   return rho * (jnp.cos(theta) + 1j * jnp.sin(theta))
 
 def view_as_complex(x):
-    return x[:, 0] + 1j * x[:, 1]
+    return x[..., 0] + 1j * x[..., 1]
 
 def view_as_real(x):
     return jnp.stack((jnp.real(x), jnp.imag(x)), axis=-1)
 
 def precompute_theta_pos_frequencies(head_dim: int, seq_len: int, theta: float = 10000.0):
     assert head_dim % 2 == 0, "Dimension must me divisible by 2"
-
+    
     theta_numerator = jnp.arange(0, head_dim, 2).astype(jnp.float32)
+    print(f"theta num {theta_numerator.shape}") #(Head dim/2)
     theta = 1.0 / (theta ** (theta_numerator / head_dim))
+    print(f"theta {theta.shape}") #(Head dim/2)
 
     m = jnp.arange(seq_len)
+    print(f"m {m.shape}") #(SeqLen)
     freqs = jnp.outer(m, theta).astype(jnp.float32)
+    print(f"freqs {freqs.shape}") #(SeqLen, HeadDim/2)
 
-    freqs_complex = polar(jnp.ones(freqs), freqs)
+    ones = jnp.ones_like(freqs)
+    freqs_complex = polar(ones, freqs)
+    print(f"freqs_complex {freqs_complex.shape}") #(SeqLen, HeadDim/2)
     return freqs_complex
 
-def apply_rotary_embeddings(x: jnp.Array, freqs_complex: jnp.Array):
-    x_complex = view_as_complex(jnp.reshape(x.astype(jnp.float32),(*x.shape, -1, 2)))
+def apply_rotary_embeddings(x, freqs_complex):
+    print(f"rotary embed x {x.shape}") # (B, Seqlen, H, Headdim)
+    x_complex = view_as_complex(jnp.reshape(x.astype(jnp.float32),(*x.shape[:-1], x.shape[-1]//2, 2)))
+    print(f"x_complex {x_complex.shape}") # (B, Seqlen, H, Headdim/2)
+
 
     freqs_complex = jnp.expand_dims(jnp.expand_dims(freqs_complex, 0), 2)
+    print(f"freqs complex {freqs_complex.shape}") # (1, Seqlen, 1, Headdim/2)
 
     x_rotated = x_complex * freqs_complex
+    print(f"x rotated {x_rotated.shape}") # (B, Seqlen, H, Headdim/2)
 
     x_out = view_as_real(x_rotated)
+    print(f"x_out {x_out.shape}") # (B, Seqlen, H, Headdim/2, 2)
 
     x_out = jnp.reshape(x_out, (x.shape))
+    print(f"x_out {x_out.shape}") # (B, Seqlen, H, Headdim)
 
     return x_out.astype(x.dtype)
 
@@ -65,17 +80,15 @@ class RMSNorm(nn.Module):
 
     @nn.compact
     def __call__(self, x):
-        weight = jax.ones(self.dim)
-        return weight * self._norm(jnp.astype(x.dtype))
+        weight = jnp.ones(self.dim)
+        return weight * self._norm(x)
     
 def repeat_kv(x, n_rep):
     batch_size, seq_len, n_kv_heads, head_dim = x.shape
     if n_rep == 1:
         return x
     else:
-        (
-            jnp.reshape(jnp.broadcast_to(x[:,:,:,None,:], (batch_size, seq_len, n_kv_heads, n_rep, head_dim)), (batch_size, seq_len, n_kv_heads* n_rep, head_dim))
-        )
+        return jnp.reshape(jnp.broadcast_to(x[:,:,:,None,:], (batch_size, seq_len, n_kv_heads, n_rep, head_dim)), (batch_size, seq_len, n_kv_heads* n_rep, head_dim))
     
 
 class SelfAttention(nn.Module):
@@ -86,30 +99,38 @@ class SelfAttention(nn.Module):
         n_kv_heads = self.config.n_heads if self.config.n_kv_heads is None else self.config.n_kv_heads
         n_heads_q  = self.config.n_heads
         n_rep = n_heads_q // n_kv_heads
+        n_kv_heads = self.config.n_heads if self.config.n_kv_heads is None else self.config.n_kv_heads
         head_dim = self.config.dim // self.config.n_heads
         wq = nn.Dense(self.config.n_heads * head_dim, use_bias=False)
-        wk = nn.Dense(self.config.n_kv_heads * head_dim, use_bias=False)
-        wv = nn.Dense(self.config.n_kv_heads * head_dim, use_bias=False)
+        wk = nn.Dense(n_kv_heads * head_dim, use_bias=False)  # Use the local n_kv_heads variable
+        wv = nn.Dense(n_kv_heads * head_dim, use_bias=False)
         wo = nn.Dense(self.config.dim, use_bias=False)
 
         cache_k = jnp.zeros((self.config.max_batch_size, self.config.max_seq_len, n_kv_heads, head_dim))
         cache_v = jnp.zeros((self.config.max_batch_size, self.config.max_seq_len, n_kv_heads, head_dim))
 
         batch_size, seq_len, _ = x.shape
-
+        print(f"x shape attn {x.shape}") # (B, 1, Dim)
+        
         xq = wq(x)
+        print(f"xq {xq.shape}")# (B, 1, Dim) -> (B, 1, H_Q * Head_Dim)
         xk = wk(x)
-        xv = wk(x)
+        print(f"xk {xk.shape}")# (B, 1, Dim) -> (B, 1, H_KV * Head_Dim)
+        xv = wv(x)
+        print(f"xv {xv.shape}")# (B, 1, Dim) -> (B, 1, H_KV * Head_Dim)
 
         xq = jnp.reshape(xq, (batch_size, seq_len, n_heads_q, head_dim))
+        print(f"xq {xq.shape}")# (B, 1, H_Q * Head_Dim) -> (B, 1, H_Q, Head_Dim)
         xk = jnp.reshape(xk, (batch_size, seq_len, n_kv_heads, head_dim))
+        print(f"xk {xk.shape}")# (B, 1, H_Q * Head_Dim) -> (B, 1, H_KV, Head_Dim)
         xv = jnp.reshape(xv, (batch_size, seq_len, n_kv_heads, head_dim))
+        print(f"xv {xv.shape}")# (B, 1, H_Q * Head_Dim) -> (B, 1, H_KV, Head_Dim)
 
         xq = apply_rotary_embeddings(xq, freqs_complex)
         xk = apply_rotary_embeddings(xk, freqs_complex)
 
-        cache_k[:batch_size, start_pos:start_pos+seq_len] = xk
-        cache_v[:batch_size, start_pos:start_pos+seq_len] = xv
+        cache_k = cache_k.at[:batch_size, start_pos:start_pos+seq_len].set(xk)
+        cache_v = cache_v.at[:batch_size, start_pos:start_pos+seq_len].set(xv)
 
         keys = cache_k[:batch_size, 0:start_pos+seq_len]
         values = cache_v[:batch_size, 0:start_pos+seq_len]
@@ -140,7 +161,7 @@ class FeedForward(nn.Module):
         if self.config.ffn_dim_multiplier is not None:
             hidden_dim = int(self.config.ffn_dim_multiplier * hidden_dim)
         
-        hidden = self.config.multiple_of * ((hidden + self.config.multiple_of - 1) // self.config.multiple_of)
+        hidden_dim = self.config.multiple_of * ((hidden_dim+ self.config.multiple_of - 1) // self.config.multiple_of)
 
         w1 = nn.Dense(hidden_dim, use_bias=False)
         w2 = nn.Dense(self.config.dim, use_bias=False)
@@ -183,11 +204,12 @@ class Transformer(nn.Module):
         freqs_complex = precompute_theta_pos_frequencies(self.config.dim // self.config.n_heads, self.config.max_seq_len * 2)
 
         # (B, seq_len)
-
+        print(f"x shape {x.shape}")
         batch_size, seq_len = x.shape
         assert seq_len == 1, "Only one token at a time can be processed"
         # (B, seq_len) -> (B, seq_len, dim)
         h = tok_embeddings(x)
+        print(f"tok embeddings {h.shape}")
 
         # retrieve the pairs (m, theta) corresponding to the positions [start_pos, start_pos + seq_len]
         freqs_comp = freqs_complex[start_pos:start_pos+seq_len]
