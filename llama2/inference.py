@@ -11,6 +11,87 @@ import jax.numpy as jnp
 from typing import Optional
 from tqdm import tqdm
 
+def replace_params(init_params, loaded_params):
+    """
+    Maps loaded parameters to the expected model structure.
+    
+    Args:
+        init_params: The initialized parameters from model.init() with the expected structure
+        loaded_params: The loaded parameters from checkpoint files
+    
+    Returns:
+        Properly structured parameters that match the model's expectations
+    """
+    import jax
+    import jax.numpy as jnp
+    from flax.core.frozen_dict import freeze, unfreeze
+    
+    # Convert to mutable dictionaries for easier manipulation
+    init_params_dict = unfreeze(init_params)
+    loaded_params_dict = unfreeze(loaded_params)
+    
+    # Create a mapping from loaded params to init params structure
+    param_mapping = {
+        # Embedding layer
+        'transformer.wte.embedding': ('params', 'Embed_0', 'embedding'),
+        
+        # Output layer
+        'lm_head.kernel': ('params', 'Dense_0', 'kernel'),
+        
+        # Final layer norm
+        'transformer.ln_f.kernel': ('params', 'LayerNorm_0', 'scale'),
+    }
+    
+    # Map transformer layers
+    for i in range(32):  # Assuming 32 encoder blocks based on the provided structure
+        # Attention layers
+        param_mapping[f'transformer.h.{i}.attention.wq.kernel'] = ('params', f'EncoderBlock_{i}', 'SelfAttention_0', 'Dense_0', 'kernel')
+        param_mapping[f'transformer.h.{i}.attention.wk.kernel'] = ('params', f'EncoderBlock_{i}', 'SelfAttention_0', 'Dense_1', 'kernel')
+        param_mapping[f'transformer.h.{i}.attention.wv.kernel'] = ('params', f'EncoderBlock_{i}', 'SelfAttention_0', 'Dense_2', 'kernel')
+        param_mapping[f'transformer.h.{i}.attention.wo.kernel'] = ('params', f'EncoderBlock_{i}', 'SelfAttention_0', 'Dense_3', 'kernel')
+        
+        # Feed-forward layers
+        param_mapping[f'transformer.h.{i}.feed_forward.w1.kernel'] = ('params', f'EncoderBlock_{i}', 'FeedForward_0', 'Dense_0', 'kernel')
+        param_mapping[f'transformer.h.{i}.feed_forward.w2.kernel'] = ('params', f'EncoderBlock_{i}', 'FeedForward_0', 'Dense_1', 'kernel')
+        param_mapping[f'transformer.h.{i}.feed_forward.w3.kernel'] = ('params', f'EncoderBlock_{i}', 'FeedForward_0', 'Dense_2', 'kernel')
+        
+        # Layer norms
+        param_mapping[f'transformer.h.{i}.attention_norm.kernel'] = ('params', f'EncoderBlock_{i}', 'LayerNorm_0', 'scale')
+        param_mapping[f'transformer.h.{i}.ffn_norm.kernel'] = ('params', f'EncoderBlock_{i}', 'LayerNorm_1', 'scale')
+    
+    # Function to get value from nested dictionaries using path
+    def get_nested(d, path):
+        for key in path:
+            if key in d:
+                d = d[key]
+            else:
+                return None
+        return d
+    
+    # Function to set value in nested dictionaries using path
+    def set_nested(d, path, value):
+        for key in path[:-1]:
+            if key not in d:
+                d[key] = {}
+            d = d[key]
+        d[path[-1]] = value
+    
+    # Apply the mapping
+    mapped_params = {}
+    for src_path_str, dest_path in param_mapping.items():
+        # Parse the source path
+        src_path = src_path_str.split('.')
+        
+        # Get the parameter from loaded_params
+        param_value = get_nested(loaded_params_dict, src_path)
+        
+        if param_value is not None:
+            # Set the parameter in the init_params structure
+            set_nested(mapped_params, dest_path, param_value)
+    
+    # Convert back to frozen dict
+    return freeze(mapped_params)
+
 class LLAMA:
     def __init__(self, model: Transformer, tokenizer: SentencePieceProcessor, model_args: ModelArgs, params):
         self.model = model
@@ -83,50 +164,20 @@ class LLAMA:
         jax_params = freeze(jax.tree.map(lambda x: jnp.asarray(x), jax_weights))
 
         # Initialize the model
-        model = Transformer(llama_config)
-        batch_size = 1
-        seq_len = 1
-        dummy_input = jnp.ones((batch_size, seq_len), dtype=jnp.int32)
-        rngs = {'params': jax.random.PRNGKey(0)}
-        
-        # Initialize the model and get a params template
-        init_params = model.init(rngs, dummy_input, 0)
-        
-        # Replace the randomly initialized weights with the loaded weights
-        # This may need adjustment based on your exact parameter structure
-        params = jax_params  # You may need to restructure jax_params to match init_params
-        
-        
-        return LLAMA(model=model, tokenizer=tokenizer, model_args=llama_config, params=params)
+        model = Transformer(llama_config)   
 
-    # @staticmethod
-    # def convert_weights(ckpts, params):
-    #     """Helper function to convert PyTorch weights to JAX compatible format."""
-    #     jax_weights = {
-    #         'transformer': {
-    #             'wte': {'embedding': np.concatenate([ckpt['tok_embeddings.weight'].type(torch.float32).numpy() for ckpt in ckpts], axis=1)},
-    #             'ln_f': {'kernel': ckpts[0]['norm.weight'].type(torch.float32).numpy()},
-    #             'h': {
-    #                 '%d' % (layer): {
-    #                     'attention': {
-    #                         'wq': {'kernel': np.concatenate([ckpt[f'layers.{layer}.attention.wq.weight'].type(torch.float32).numpy() for ckpt in ckpts], axis=0).transpose()},
-    #                         'wk': {'kernel': np.concatenate([ckpt[f'layers.{layer}.attention.wk.weight'].type(torch.float32).numpy() for ckpt in ckpts], axis=0).transpose()},
-    #                         'wv': {'kernel': np.concatenate([ckpt[f'layers.{layer}.attention.wv.weight'].type(torch.float32).numpy() for ckpt in ckpts], axis=0).transpose()},
-    #                         'wo': {'kernel': np.concatenate([ckpt[f'layers.{layer}.attention.wo.weight'].type(torch.float32).numpy() for ckpt in ckpts], axis=1).transpose()},
-    #                     },
-    #                     'feed_forward': {
-    #                         'w1': {'kernel': np.concatenate([ckpt[f'layers.{layer}.feed_forward.w1.weight'].type(torch.float32).numpy() for ckpt in ckpts], axis=0).transpose()},
-    #                         'w2': {'kernel': np.concatenate([ckpt[f'layers.{layer}.feed_forward.w2.weight'].type(torch.float32).numpy() for ckpt in ckpts], axis=1).transpose()},
-    #                         'w3': {'kernel': np.concatenate([ckpt[f'layers.{layer}.feed_forward.w3.weight'].type(torch.float32).numpy() for ckpt in ckpts], axis=0).transpose()},
-    #                     },
-    #                     'attention_norm': {'kernel': ckpts[0][f'layers.{layer}.attention_norm.weight'].type(torch.float32).numpy()},
-    #                     'ffn_norm': {'kernel': ckpts[0][f'layers.{layer}.ffn_norm.weight'].type(torch.float32).numpy()},
-    #                 } for layer in range(params['n_layers'])
-    #             },
-    #         },
-    #         'lm_head': {'kernel': np.concatenate([ckpt['output.weight'].type(torch.float32).numpy() for ckpt in ckpts], axis=0).transpose()},
-    #     }
-    #     return jax_weights
+        key = jax.random.PRNGKey(0)
+        dummy_input = jnp.ones((1, 1), dtype=jnp.int32)
+        init_params = model.init(key, dummy_input, 0)
+        
+        # Print parameter structure to understand the model's expectations
+        if verbose:
+            print("Model expects parameters with this structure:")
+            print(jax.tree_map(lambda x: x.shape if hasattr(x, 'shape') else None, init_params))   
+        mapped_params = replace_params(init_params, jax_params)  
+            
+        return LLAMA(model=model, tokenizer=tokenizer, model_args=llama_config, params=mapped_params)
+
 
     @staticmethod
     def config_from_params(args: ModelArgs) -> ModelArgs:
@@ -163,7 +214,8 @@ class LLAMA:
         cur_iterator = tqdm(range(1, total_len), desc="Generating Tokens")
         
         for cur_pos in cur_iterator:
-            logits = self.model.apply(self.params, tokens[:, :cur_pos], cur_pos)
+            print(f"tokens[:, :cur_pos] {tokens[:, :cur_pos]}")
+            logits = self.model.apply(self.params, tokens[:, cur_pos-1:cur_pos], cur_pos)
             if temperature > 0:
                 probs = jax.nn.softmax(logits[:, -1] / temperature, axis=1)
                 key, subkey = jax.random.split(key)  # Split key for randomness
@@ -197,38 +249,36 @@ class LLAMA:
         
         return (out_tokens, out_text)
     def sample_top_p(self, probs, p, key):
-        """Sample from top-p (nucleus) distribution."""
+        # Create an index array that matches the batch dimension of probs
+        batch_size = probs.shape[0]
+        vocab_size = probs.shape[-1]
+        
+        # Create indices tensor with same batch dimension as probs
+        indices = jnp.tile(jnp.arange(vocab_size, dtype=jnp.int32)[None, :], (batch_size, 1))
+        
         probs_sort, probs_idx = jax.lax.sort_key_val(
-            probs, jnp.arange(probs.shape[-1], dtype=jnp.int32), 
-            dimension=-1, is_stable=True, is_ascending=False
+            probs, indices, 
+            dimension=-1, is_stable=True
         )
+        print(f"probs sort {probs_sort.shape}")
         
-        # Compute cumulative sum
+        # Rest of your implementation remains the same
         probs_sum = jnp.cumsum(probs_sort, axis=-1)
-        
-        # Create mask for values to keep (cumulative sum - current prob <= p)
+        print(f"probs sum {probs_sum.shape}")
         mask = probs_sum <= p
-        
-        # Zero out probabilities not selected by top-p
+        print(f"mask {mask.shape}")
         probs_sort = jnp.where(mask, probs_sort, 0.0)
-        
-        # Renormalize the remaining probabilities
         probs_sort = probs_sort / jnp.sum(probs_sort, axis=-1, keepdims=True)
+        print(f"probs sort {probs_sort.shape}")
         
-        # Sample a token index from the top-p distribution
-        next_token_idx = jax.random.choice(
-            key, 
-            jnp.arange(probs.shape[-1]), 
-            shape=(probs.shape[0],), 
-            replace=True, 
-            p=probs_sort
-        )
-        
-        # Convert the sampled index back to the original vocabulary indices
-        next_token = jnp.take_along_axis(probs_idx, next_token_idx[:, None], axis=-1)
-        
-        return next_token.squeeze(-1)
+        def sample_fn(k, ps):
+            return jax.random.choice(k, jnp.arange(vocab_size), shape=(), replace=True, p=ps)
 
+        keys = jax.random.split(key, batch_size)
+        next_token_idx = jax.vmap(sample_fn)(keys, probs_sort)
+
+        next_token = jnp.take_along_axis(probs_idx, next_token_idx[:, None], axis=-1)
+        return next_token.squeeze(-1)
 if __name__ == '__main__':
     
     
@@ -236,17 +286,17 @@ if __name__ == '__main__':
         "Simply put, the theory of relativity states that ",
         "If Google was an Italian company founded in Milan, it would",
         # Few shot promt
-        """Translate English to French:
+        # """Translate English to French:
         
-        sea otter => loutre de mer
-        peppermint => menthe poivrée
-        plush girafe => girafe peluche
-        cheese =>""",
-        # Zero shot prompt
-        """Tell me if the following person is actually Doraemon disguised as human:
-        Name: Umar Jamil
-        Decision: 
-        """
+        # sea otter => loutre de mer
+        # peppermint => menthe poivrée
+        # plush girafe => girafe peluche
+        # cheese =>""",
+        # # Zero shot prompt
+        # """Tell me if the following person is actually Doraemon disguised as human:
+        # Name: Umar Jamil
+        # Decision: 
+        # """
     ]
     
     model = LLAMA.build(
